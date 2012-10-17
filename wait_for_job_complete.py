@@ -15,22 +15,39 @@ import aws_consts
 DEFAULT_SNS_TOPIC = 'wait_for_job_complete_topic'
 DEFAULT_SQS_QUEUE = 'wait_for_job_complete_queue'
 
-def construct_topic_arn(
-    topic_name,
+# See:
+# - http://docs.amazonwebservices.com/sns/latest/gsg/SendMessageToSQS.html
+# - http://www.elastician.com/2010/04/subscribing-sqs-queue-to-sns-topic.html
+SQS_POLICY_TMPL = """\
+{
+  "Version": "2008-10-17",
+  "Id": "%(queue_arn)s/SQSDefaultPolicy",
+  "Statement": [
+    {
+      "Sid": "Sid1350464522515",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "*"
+      },
+      "Action": "SQS:SendMessage",
+      "Resource": "%(queue_arn)s",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "%(topic_arn)s"
+        }
+      }
+    }
+  ]
+}
+"""
+
+def construct_arn(service, name,
     account_id=aws_consts.ACCOUNT_ID,
     region_name=aws_consts.REGION_NAME):
-    return 'arn:aws:sns:%(region_name)s:%(account_id)s:%(topic_name)s' % {
+    return 'arn:aws:%(service)s:%(region_name)s:%(account_id)s:%(name)s' % {
+        'service': service,
         'region_name': region_name, 'account_id': account_id,
-        'topic_name': topic_name}
-
-
-def construct_queue_arn(
-    queue_name,
-    account_id=aws_consts.ACCOUNT_ID,
-    region_name=aws_consts.REGION_NAME):
-    return 'arn:aws:sqs:%(region_name)s:%(account_id)s:%(queue_name)s' % {
-        'region_name': region_name, 'account_id': account_id,
-        'queue_name': queue_name}
+        'name': name}
 
 
 def has_endpoint_for(topic_arn, queue_arn):
@@ -59,11 +76,11 @@ if __name__ == '__main__':
         sys.exit(1)
         pass
     vault_name = sys.argv[1]
-
+    vault_arn  = construct_arn('glacier', vault_name)
     topic_name = DEFAULT_SNS_TOPIC
-    topic_arn  = construct_topic_arn(topic_name)
+    topic_arn  = construct_arn('sns', topic_name)
     queue_name = DEFAULT_SQS_QUEUE
-    queue_arn  = construct_queue_arn(queue_name)
+    queue_arn  = construct_arn('sqs', queue_name) 
 
     layer2 = boto.glacier.layer2.Layer2(
         aws_access_key_id = aws_consts.ACCESS_KEY_ID,
@@ -80,32 +97,12 @@ if __name__ == '__main__':
         sys.exit(1)
         pass
     
-    jobs = vault.list_jobs()
-    if len(jobs) == 0:
-        print >>sys.stderr, 'Job not available'
-        sys.exit(1)
-        pass
-
-    if len(jobs) > 1:
-        print >>sys.stderr, 'Multiple job id found:'
-        for i, job in enumerate(jobs):
-            print '%d: %s' % (i, job.id)
-            pass
-        # TODO: implement it :-P
-        # print >>sys.stderr, 'Specify job_id using -j, orindex with -i'
-        sys.exit(1)
-        pass
-    else:
-        job = jobs[0]
-        pass
-
     sqs_conn = boto.sqs.connect_to_region(
         region_name=aws_consts.REGION_NAME,
         aws_access_key_id = aws_consts.ACCESS_KEY_ID,
         aws_secret_access_key = aws_consts.SECRET_ACCESS_KEY)
     queue = sqs_conn.get_queue(queue_name)
     if queue is not None:
-        print >>sys.stderr, 'Queue %s already exists.' % queue_name
         if queue.count() > 0:
             print >>sys.stderr, 'Queue %s has message(s).' % queue_name
             print >>sys.stderr, 'Removing each item'
@@ -117,25 +114,27 @@ if __name__ == '__main__':
                 pass
             print >>sys.stderr, ''.join([
                 'All existing messages should be marked as ',
-                'deleted, but may be remaining for a while. ',
+                'deleted, but may be remaining for a while.\n',
                 'Re-run this script after a while, or after ',
                 'confirming everything is ready again.'])
             sys.exit(1)
             pass
+        # TODO: Verify Policy validity of the existing queue.
         pass
     else:
         print >>sys.stderr, 'queue %s doesn\'t exist. Creating it.' % (
             queue_name)
         queue = sqs_conn.create_queue(queue_name)
+        queue.set_attribute(
+            'Policy',
+            SQS_POLICY_TMPL % {'queue_arn': queue_arn,
+                               'topic_arn': topic_arn})
         pass
-    print 'Queue: ', queue
-
     sns_conn = boto.sns.connect_to_region(
         region_name=aws_consts.REGION_NAME,
         aws_access_key_id = aws_consts.ACCESS_KEY_ID,
         aws_secret_access_key = aws_consts.SECRET_ACCESS_KEY)
     if sns_topic_exists(sns_conn, topic_arn):
-        print >>sys.stderr, 'Topic %s already exists.' % topic_name
         if not has_endpoint_for(topic_arn, queue_arn):
             print >>sys.stderr, 'Topic %s doesn\'t has a endpoint for %s' % (
                 topic_arn, queue_arn)
@@ -149,22 +148,30 @@ if __name__ == '__main__':
         sns_conn.subscribe(topic_arn, 'sqs', queue_arn)
         pass
 
+    print 'Vault: %s' % vault_arn
+    print 'Queue: %s' % queue_arn
+    print 'Topic: %s' % topic_arn
+    print
+
     layer2.layer1.set_vault_notifications(
         vault_name,
         {'SNSTopic': topic_arn,
          'Events': ['ArchiveRetrievalCompleted',
                     'InventoryRetrievalCompleted']})
 
-    print 'Now, waiting for some message from the queue %s.' % queue_name
+    print 'Waiting for some message from the queue %s.' % queue_name
 
     t1 = time.time()
     while True:
         messages = queue.get_messages()
         if messages:
             message = messages[0]
-            print 'New message found (type: %s): %s' % (
-                type(message), str(message))
-            # queue.delete_message(message)
+            if type(message) is str:
+                msg_content = message
+            else:  # Trust it is a boto.sqs.message.Message kind.
+                msg_content = message.get_body()
+                pass
+            print 'New message found: %s' % msg_content
             break
         else:
             # 1 min.
@@ -172,5 +179,6 @@ if __name__ == '__main__':
             pass
         pass
     t2 = time.time()
+
     print 'Waited for %f min.' % ((t2 - t1) / 60)
     print datetime.datetime.today().strftime('Now: %Y-%m-%d %H:%S')
