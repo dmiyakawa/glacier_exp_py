@@ -12,7 +12,7 @@ import aws_consts
 layer2 = boto.glacier.layer2.Layer2(
     aws_access_key_id = aws_consts.ACCESS_KEY_ID,
     aws_secret_access_key = aws_consts.SECRET_ACCESS_KEY,
-    region_name='ap-northeast-1')
+    region_name=aws_consts.REGION_NAME)
 
 def get_name_candidate(vault_basename, seq_num):
     return '%s_%s' % (vault_basename, seq_num)
